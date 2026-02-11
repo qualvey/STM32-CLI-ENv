@@ -1,0 +1,3 @@
+C:/Users/ryu/code/stm32/cli/build/CMakeFiles/stm32_cli_test.elf.dir
+C:/Users/ryu/code/stm32/cli/build/CMakeFiles/edit_cache.dir
+C:/Users/ryu/code/stm32/cli/build/CMakeFiles/rebuild_cache.dir

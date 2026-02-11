@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Users/ryu/code/stm32/cli/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

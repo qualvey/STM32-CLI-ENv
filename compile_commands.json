@@ -1,0 +1,14 @@
+[
+{
+  "directory": "C:/Users/ryu/code/stm32/cli/build",
+  "command": "\"C:/Program Files (x86)/Arm GNU Toolchain arm-none-eabi/14.3 rel1/bin/arm-none-eabi-gcc.exe\" -DSTM32F103xB -IC:/Users/ryu/code/stm32/cli/Drivers/CMSIS/Core/Include -IC:/Users/ryu/code/stm32/cli/Drivers/CMSIS/Device/ST/STM32F1xx/Include -mcpu=cortex-m3 -mthumb -Wall -g -std=c99 -o CMakeFiles/stm32_cli_test.elf.dir/main.c.obj -c C:/Users/ryu/code/stm32/cli/main.c",
+  "file": "C:/Users/ryu/code/stm32/cli/main.c",
+  "output": "CMakeFiles/stm32_cli_test.elf.dir/main.c.obj"
+},
+{
+  "directory": "C:/Users/ryu/code/stm32/cli/build",
+  "command": "\"C:/Program Files (x86)/Arm GNU Toolchain arm-none-eabi/14.3 rel1/bin/arm-none-eabi-gcc.exe\" -DSTM32F103xB -IC:/Users/ryu/code/stm32/cli/Drivers/CMSIS/Core/Include -IC:/Users/ryu/code/stm32/cli/Drivers/CMSIS/Device/ST/STM32F1xx/Include -mcpu=cortex-m3 -mthumb -o CMakeFiles/stm32_cli_test.elf.dir/startup_stm32f103x6.s.obj -c C:/Users/ryu/code/stm32/cli/startup_stm32f103x6.s",
+  "file": "C:/Users/ryu/code/stm32/cli/startup_stm32f103x6.s",
+  "output": "CMakeFiles/stm32_cli_test.elf.dir/startup_stm32f103x6.s.obj"
+}
+]
