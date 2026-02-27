@@ -2,19 +2,18 @@
 #include <stdio.h>
 #include "stm32f103xb.h"
 #include "system_stm32f1xx.h"
-#include "digital_num.h"
+#include "tm1650.h"
 // todo: 一个开关，开关整个机器
 //  定义一个简单的超时常量
 #define I2C_TIMEOUT 10000
-// 定义快速操作宏
-#define SCL_H GPIOB->BSRR = GPIO_BSRR_BS8
-#define SCL_L GPIOB->BSRR = GPIO_BSRR_BR8
-#define SDA_H GPIOB->BSRR = GPIO_BSRR_BS9
-#define SDA_L GPIOB->BSRR = GPIO_BSRR_BR9
-#define SDA_READ (GPIOB->IDR & GPIO_IDR_IDR9)
 
 #define MPU6050_ADDR 0xD0 // MPU6050 的 I2C 地址 (AD0 接地时)
+
+void Servo_SetAngle(uint16_t angle);
+void Servo_Rotate_Relative(uint16_t delta, uint8_t isadd);
 //
+volatile uint32_t seconds = 0;
+
 volatile uint32_t ms_ticks = 0;
 volatile uint8_t flag = 0;
 volatile uint8_t fill_state = 0x00; // 初始状态为 0x00 (黑)
@@ -25,7 +24,9 @@ volatile uint8_t pwm_counter = 0;
 volatile uint8_t brightness = 20;        // 0-100 级，数字越小越暗
 volatile uint16_t long_press_timer = 0;  // 长按计时器
 volatile uint16_t auto_repeat_timer = 0; // 连发频率计时器
-
+volatile uint16_t current_angle = 90;    // [修复] 初始值设为90，与 main 中 Servo_SetAngle(90) 保持同步
+// 必须加 volatile，防止编译器优化导致死循环
+volatile uint32_t Delay_Timer = 0;
 #define LONG_PRESS_TIME 50 // 50 * 10ms = 500ms 进入长按
 #define REPEAT_SPEED 10    // 10 * 10ms = 100ms 触发一次减法
 //
@@ -58,24 +59,27 @@ void SetClock72M(void)
     while ((RCC->CFGR & 0x0C) != 0x08)
         ; // 等待切换完成
 }
-
-void delay(uint32_t count)
-{
-    for (volatile uint32_t i = 0; i < count; i++)
-        ;
-}
-volatile uint8_t led_b9_enable = 1;
+// 这个名字是固定的，不能改
 void SysTick_Handler(void)
 {
-    Seg_Scan();
-    // ms_ticks++;
-    // // 检查是否到了 PA6 该闪烁的时间
-    // if (ms_ticks >= next_pa6)
-    // {
-    //     led_b9_enable = !led_b9_enable;
-    //     next_pa6 = ms_ticks + 300;
-    // }
+    static uint32_t count = 0;
+    if (Delay_Timer != 0)
+    {
+        Delay_Timer--; // 每 1ms 减 1
+    }
 }
+/**
+ * @brief  毫秒级延时函数
+ * @param  ms: 延时时长（毫秒）
+ */
+void delay_ms(uint32_t ms)
+{
+    Delay_Timer = ms; // 赋初始值
+    while (Delay_Timer != 0)
+        ; // 等待中断将其减为 0
+}
+volatile uint8_t led_b9_enable = 1;
+volatile uint8_t num_brightness = 0;
 // B10,B11,Hard I2C2
 void I2C2_Init(void)
 {
@@ -182,161 +186,6 @@ uint8_t I2C2_ReadByte(uint8_t dev_addr, uint8_t reg_addr)
     return data;
 }
 
-// 极简 I2C 发送字节
-void I2C_Send(uint8_t byte)
-{
-    for (int i = 0; i < 8; i++)
-    {
-        if (byte & 0x80)
-            SDA_H;
-        else
-            SDA_L;
-        // 这里需要一点点延迟，如果你的 SystemCoreClock 是 8MHz，空循环几次即可
-        for (volatile int d = 0; d < 1000; d++)
-            ;
-        SCL_H;
-        for (volatile int d = 0; d < 1000; d++)
-            ;
-        SCL_L;
-        byte <<= 1;
-    }
-    // 释放 SDA 等待 ACK（这里简单处理，直接给个脉冲）
-    SDA_H;
-    SCL_H;
-    for (volatile int d = 0; d < 10; d++)
-        ;
-    SCL_L;
-}
-
-// 停止信号：SCL高电平时，SDA由低变高
-void I2C_Stop(void)
-{
-    SDA_L; // 先确保 SDA 是低的
-    for (volatile int d = 0; d < 100; d++)
-        ;
-    SCL_H; // 拉高 SCL
-    for (volatile int d = 0; d < 100; d++)
-        ;
-    SDA_H; // 在 SCL 高电平期间拉高 SDA，触发 Stop
-    for (volatile int d = 0; d < 100; d++)
-        ;
-}
-
-// OLED 写命令函数
-void OLED_Cmd(uint8_t cmd)
-{
-    // --- Start 信号 ---
-    SDA_H;
-    SCL_H;
-    for (volatile int d = 0; d < 10; d++)
-        ; // 极短延时即可
-    SDA_L;
-    for (volatile int d = 0; d < 10; d++)
-        ;
-    SCL_L;
-    I2C_Send(0x78); // OLED 地址
-    I2C_Send(0x00); // 命令模式
-    I2C_Send(cmd);  // 发送指令
-    I2C_Stop();
-}
-
-void OLED_GPIO_Init(void)
-{
-    // 1. 开启 GPIOB 时钟
-    RCC->APB2ENR |= RCC_APB2ENR_IOPBEN;
-
-    // 2. 配置 PB8 和 PB9
-    // CRH 寄存器中，每 4 位控制一个引脚。
-    // PB8 对应 CRH 的 0-3 位，PB9 对应 4-7 位。
-    // 0x7 代表：通用开漏输出 (01) + 最大速度 50MHz (11) -> 0111 (二进制)
-    GPIOB->CRH &= ~(0xFF << 0); // 清除 PB8, PB9 的配置位
-    GPIOB->CRH |= (0x77 << 0);  // 设置 PB8, PB9 为开漏输出 50MHz
-    // 3. 初始状态设为高电平（I2C 总线空闲状态）
-    GPIOB->BSRR = (GPIO_BSRR_BS8 | GPIO_BSRR_BS9);
-    // OLED_Cmd(0xAE);
-    // OLED_Cmd(0xD5);
-    // OLED_Cmd(0x80);
-
-    // OLED_Cmd(0xA8);
-    // OLED_Cmd(0x3F);
-
-    // OLED_Cmd(0xD3);
-    // OLED_Cmd(0x00);
-    // OLED_Cmd(0x40);
-    // OLED_Cmd(0xA1);
-    // OLED_Cmd(0xC8);
-    // OLED_Cmd(0xDA);
-    // OLED_Cmd(0x12);
-    // OLED_Cmd(0x81);
-}
-void OLED_Clear(volatile uint8_t *data)
-{
-    printf("oled clearing , it's time coster");
-    for (uint8_t i = 0; i < 8; i++)
-    {
-        OLED_Cmd(0xB0 + i); // 设置页地址 (0-7)
-        OLED_Cmd(0x00);     // 设置起始列低地址
-        OLED_Cmd(0x10);     // 设置起始列高地址
-
-        // 开始发数据
-        SDA_H;
-        SCL_H;
-        SDA_L;
-        SCL_L; // Start
-        I2C_Send(0x78);
-        I2C_Send(0x40); // 0x40 代表接下来全是数据（Data）
-        for (uint8_t j = 0; j < 128; j++)
-        {
-            I2C_Send(*data); // 0x00 全黑, 0xFF 全亮
-        }
-        SCL_H;
-        SDA_H; // Stop
-    }
-}
-void I2C_Delay(void)
-{
-    for (volatile int i = 0; i < 50; i++)
-        ; // 8MHz 下约 10-20us，保证信号爬升
-}
-
-// 软件模拟 I2C 起始信号
-void I2C_Start(void)
-{
-    SDA_H;
-    SCL_H;
-    I2C_Delay();
-    SDA_L;
-    I2C_Delay(); // SCL 高电平时 SDA 下降沿
-    SCL_L;
-    I2C_Delay();
-}
-
-// 发送一个字节并检查 ACK
-int I2C_SendByte_CheckACK(uint8_t byte)
-{
-    // 1. 发送 8 位数据
-    for (int i = 0; i < 8; i++)
-    {
-        if (byte & 0x80)
-            SDA_H;
-        else
-            SDA_L;
-        I2C_Delay();
-        SCL_H;
-        I2C_Delay();
-        SCL_L;
-        byte <<= 1;
-    }
-    // 2. 读取 ACK
-    SDA_H; // 释放 SDA 让从机控制
-    I2C_Delay();
-    SCL_H;
-    I2C_Delay();
-    int ack = !SDA_READ; // 从机拉低 SDA 代表有应答 (ACK)
-    SCL_L;
-    return ack;
-}
-
 void MPU6050_Init(void)
 {
     // 解除睡眠模式：向 PWR_MGMT_1 (0x6B) 写入 0x00
@@ -358,6 +207,7 @@ int _write(int file, char *ptr, int len)
     }
     return len;
 }
+
 // PA9(TX);PA10(RX)
 // Notice: 接线时和TTL,是TX->RX的关系
 /*
@@ -443,6 +293,10 @@ void button_init()
     GPIOA->CRL &= ~(0xF << 8); // clear
     GPIOA->CRL |= (0x8 << 8);  //
     GPIOA->ODR |= (1 << 2);    // 1是上拉
+    // PA4
+    GPIOA->CRL &= ~(0xF << 16);
+    GPIOA->CRL |= (0x8 << 16);
+    GPIOA->ODR |= (1 << 4);
 }
 
 void EXTI2_IRQHandler(void)
@@ -460,6 +314,30 @@ void EXTI2_IRQHandler(void)
         // 在 STM32 中，往该位写 1 才是清除标志
         EXTI->PR = (1 << 2);
     }
+}
+/**
+ * 相对转动函数
+ * @param delta: 想要转动的增量（例如 90 或 -90）
+ */
+void Servo_Rotate_Relative(uint16_t delta, uint8_t isadd)
+{
+    if (isadd)
+    {
+        current_angle += delta;
+        if (current_angle > 180)
+            current_angle = 180;
+    }
+    else
+    {
+        // [修复] 防止无符号数减法溢出 (例如 0 - 90 会变成 65446)
+        if (current_angle < delta)
+            current_angle = 0;
+        else
+            current_angle -= delta;
+    }
+
+    // 3. 调用你之前的设置函数
+    Servo_SetAngle(current_angle);
 }
 // 统一的亮度更新函数，防止溢出
 void update_brightness(uint8_t is_add)
@@ -517,6 +395,7 @@ void handle_key_logic(uint8_t pin_num, volatile KeyState_t *state,
         {
             // 执行动作
             update_brightness(is_add);
+            Servo_Rotate_Relative(90, is_add);
             lp_timers[pin_num] = 0;
             *state = KEY_STATE_PRESSED;
         }
@@ -579,16 +458,20 @@ void Timer2_Init(void)
 }
 volatile uint8_t update_flag = 0;  // 触发标志位
 volatile uint32_t timer_ticks = 0; // 中断计数器
-uint32_t display_count = 0;        // 数码管要显示的数字
+
+volatile uint8_t cdown = 0;
+
 // PWM调光
 void TIM2_IRQHandler(void)
 {
+    static uint16_t led_flash_timer = 0;
     if (TIM2->SR & TIM_SR_UIF)
     {                            // 检查更新标志
         TIM2->SR &= ~TIM_SR_UIF; // 清除标志位
 
         timer_ticks++;
         // 1s = 10000 * 0.1ms
+        // 这里正好是1s,可以给时钟使用
         if (timer_ticks >= 10000)
         {
             update_flag = 1; // 仅立一个Flag，不在这里执行耗时任务
@@ -620,27 +503,35 @@ void TIM2_IRQHandler(void)
         {
             pwm_counter = 0;
         }
-
         // 逻辑：如果计数器小于亮度等级，就关灯（PC13 通常低电平亮，所以 BS 是灭）
         // 这里的逻辑基于你的 PC13 是低电平点亮还是高电平点亮
         if (pwm_counter < brightness)
         {
             // C13
             GPIOC->BSRR = (1 << (13 + 16));
+            GPIOB->BSRR = GPIO_BSRR_BR0;
         }
         else
         {
             // C13
             GPIOC->BSRR = (1 << 13);
+            GPIOB->BSRR = GPIO_BSRR_BS0;
         }
-        // b9同时带着闪烁
+        // b9保持PWM调光的同时，固定频率闪烁
+        // 这个需要单独的计数器控制频率，翻转状态
+        led_flash_timer++;
+        if (led_flash_timer >= 5000)
+        {
+            led_flash_timer = 0;
+            led_b9_enable = !led_b9_enable;
+        }
         if (led_b9_enable && pwm_counter < brightness)
         {
-            GPIOB->BSRR = (1 << 9 + 16);
+            GPIOB->BSRR = GPIO_BSRR_BR9;
         }
         else
         {
-            GPIOB->BSRR = (1 << 9);
+            GPIOB->BSRR = GPIO_BSRR_BS9;
         }
 
         // --- 2. 状态机按键扫描 (每10ms扫描一次比较稳) ---
@@ -648,8 +539,14 @@ void TIM2_IRQHandler(void)
         if (++scan_timer >= 100)
         { //
             scan_timer = 0;
+            uint8_t key_down = !(GPIOA->IDR & (1 << 4));
+            if (key_down)
+            {
+                cdown = 1;
+            }
             handle_key_logic(1, &g_buttona1_state, 0);
             handle_key_logic(0, &g_buttona0_state, 1); // 1 代表加
+            TM1650_SetBrightness_Adaptive(brightness);
         }
     }
 }
@@ -693,32 +590,84 @@ void Encoder_Init(void)
 }
 
 void LED_init(void)
-{
+{ // 低电平亮
     // enable->config->bit set;标准的三步曲
     // B9
     RCC->APB2ENR |= RCC_APB2ENR_IOPBEN;
     GPIOB->CRH &= ~(0xF << 4);
     GPIOB->CRH |= (0x3 << 4);
     GPIOB->BSRR = GPIO_BSRR_BR9;
-    RCC->APB2ENR |= RCC_APB2ENR_IOPCEN;
+    // B0
+    RCC->APB2ENR |= RCC_APB2ENR_IOPBEN;
+    GPIOB->CRH &= ~(0xF << 0);
+    GPIOB->CRH |= (0x3 << 0);
+    GPIOB->BSRR = GPIO_BSRR_BR0;
     // C13
+    RCC->APB2ENR |= RCC_APB2ENR_IOPCEN;
     GPIOC->CRH &= ~(0xF << 20);
     GPIOC->CRH |= (0x3 << 20);
-    GPIOC->BSRR = GPIO_BSRR_BR13; // c13低电平亮
+    GPIOC->BSRR = GPIO_BSRR_BR13;
+}
+
+// 专门给舵机用的初始化，不影响你的 Timer2_Init
+void Servo_Init(void)
+{
+    // 1. 开启 TIM1 (高级定时器) 和 GPIOA 的时钟
+    RCC->APB2ENR |= RCC_APB2ENR_TIM1EN;
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN;
+
+    // 2. 配置 PA8 为复用推挽输出 (Alt Function Push-Pull)
+    // PA8 对应 CRH 寄存器的第 0-3 位
+    // 设置为 0xB (1011): 50MHz 复用推挽
+    GPIOA->CRH &= ~(0xF << 0);
+    GPIOA->CRH |= (0xB << 0);
+
+    // 3. 设置定时器参数：产生 20ms 周期
+    // 72MHz / 72 = 1MHz (1us 计数一次)
+    TIM1->PSC = 71;
+    // 计数 20000 次 = 20ms
+    TIM1->ARR = 19999;
+
+    // 4. 配置通道 1 (CH1) 为 PWM 模式 1
+    TIM1->CCMR1 &= ~(0x7 << 4);     // 清除原来的模式
+    TIM1->CCMR1 |= (6 << 4);        // 设置 OC1M = 110 (PWM Mode 1)
+    TIM1->CCMR1 |= TIM_CCMR1_OC1PE; // 开启预装载
+
+    // 5. 使能通道 1 输出开关
+    TIM1->CCER |= TIM_CCER_CC1E;
+
+    // 6. 【关键】高级定时器 TIM1 需要开启主输出使能 (MOE)
+    TIM1->BDTR |= TIM_BDTR_MOE;
+
+    // 7. 开启定时器
+    TIM1->CR1 |= TIM_CR1_CEN;
+
+    // 初始位置：90度 (1.5ms)
+    TIM1->CCR1 = 1500;
+}
+// 对应的角度设置函数
+void Servo_SetAngle(uint16_t angle)
+{
+    if (angle < 0)
+        angle = 0;
+    if (angle > 180)
+        angle = 180;
+
+    // 映射：0~180度 -> 500~2500us
+    uint16_t compare = 500 + (angle * 2000 / 180);
+    TIM1->CCR1 = compare;
 }
 
 int main(void)
 {
+
     SetClock72M();
     SystemCoreClockUpdate();
     // 你每跳够 SystemCoreClock / 1000下，就给我报个信（进一次中断）”。这个不管CPU频率，都是1ms
-    SysTick_Config(SystemCoreClock / 10000);
-    // I2C1使能
-    RCC->APB1ENR |= RCC_APB1ENR_I2C1EN;
-    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN;
-    RCC->APB2ENR |= RCC_APB2ENR_IOPBEN;
-    RCC->APB2ENR |= RCC_APB2ENR_IOPCEN;
+    SysTick_Config(SystemCoreClock / 1000);
+
     USART_init();
+
     printf("SystemCoreClock: %d \n", SystemCoreClock);
     //
     GPIOB->CRH &= ~(0xF << 24);
@@ -728,78 +677,18 @@ int main(void)
     Encoder_Init();
     Timer2_Init();
     LED_init();
-    // 数码管
-    Seg_Hardware_Init();
-    printNum(9999);
-    // PB0,1 test low
-    // RCC->APB2RSTR |= RCC_APB2RSTR_ADC1RST; // 强制复位 ADC1
-    // RCC->APB2RSTR &= ~RCC_APB2RSTR_ADC1RST;
-    // RCC->APB2ENR &= ~RCC_APB2ENR_ADC1EN; // 确保 ADC1 时钟关闭
-    // GPIOB->CRL &= ~(0xF << 4);
-    // GPIOB->CRL |= (0x3 << 4);
-    // GPIOB->BSRR = GPIO_BSRR_BR1;
-    // GPIOB->CRL &= ~(0xF << 0);
-    // GPIOB->CRL |= (0x3 << 0);
-    // GPIOB->BSRR = GPIO_BSRR_BR0;
-
-    //  OLED_GPIO_Init();
-    //  OLED_Cmd(0x8D); // 设置电荷泵
-    //  OLED_Cmd(0x14); // 开启
-    //  OLED_Cmd(0xAF); // 开启显示
-    //   I2C ack
-    // 3. 配置 PC13 为推挽输出 (LED)
-
-    // 4. 执行握手测试 (OLED 地址通常是 0x78)
-    // I2C_Start();
-    // if (I2C_SendByte_CheckACK(0x78)) {
-    //  // 握手成功！点亮 PC13 (通常低电平亮)
-    //  GPIOB->BSRR = GPIO_BSRR_BS13;
-    //}
-
-    /* 2. 配置 PC13 引脚模式 */
-    /* CRH 是高 8 位引脚寄存器，每个引脚占 4 位。PC13 对应 [23:20] 位 */
-    /* 先清除原有的配置，再设置为 0x3 (通用推挽输出，50MHz) */
-    // GPIOC->CRH &= ~(0xF << 20);
-    // GPIOC->CRH |= (0x3 << 20);
-
-    /* 3. 设置初始状态（关键点！） */
-    // 让 PC13 初始为低电平，PA6 初始为高电平
-    // GPIOC->ODR &= ~(1 << 13);
-    // ~ 是取反操作
-    // &是与运算, &=是运算并赋值
-    // ODR(Output Data Register)
-
-    printf("System Startup...\n");
+    Servo_Init();
+    Servo_SetAngle(90);
+    tm1650_init();
 
     while (1)
     {
         if (update_flag)
         {
+            seconds++;
             update_flag = 0;
-            printNum(display_count++); // 在主循环中执行显示逻辑
-            update_flag = 0;           // 处理完后清除标志
+            // 这里可以放一些需要定时执行的任务，例如更新时间显示
+            Display_Time_Auto(seconds); // 传入总秒数，自动格式化显示
         }
     }
 }
-// I2C2_Init();
-// MPU6050_Init();
-// uint8_t chip_id;
-// int16_t accel_x;
-// uint8_t data_h, data_l;
-
-//    if (flag) {
-//      printf("fill_state,%d", fill_state);
-//      printf("get flag");
-//      OLED_Clear(fill_state);
-//      flag = 0;
-//    }
-
-// 2. 读取 WHO_AM_I (寄存器 0x75)，验证 I2C 是否通了
-// 正常应该返回 0x68
-// chip_id = I2C2_ReadByte(MPU6050_ADDR, 0x75);
-// printf("MPU ID: 0x%X\n", chip_id);
-
-//// 3. 读取加速度 X轴 (高8位 0x3B, 低8位 0x3C)
-// data_h = I2C2_ReadByte(MPU6050_ADDR, 0x3B);
-// data_l = I2C2_ReadByte(MPU6050_ADDR, 0x3C);
-// accel_x = (data_h << 8) | data_l; // 合成 16 位数据

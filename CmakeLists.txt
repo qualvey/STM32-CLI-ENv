@@ -53,7 +53,8 @@ set(CMAKE_EXE_LINKER_FLAGS "${MCU_FLAGS} -T ${LINKER_SCRIPT} --specs=nosys.specs
 # ==========================================
 add_executable(${PROJECT_NAME}.elf 
     main.c
-    digital_num.c
+    # digital_num.c
+    tm1650.c
     Drivers/CMSIS/Device/ST/STM32F1xx/Source/Templates/system_stm32f1xx.c
     startup_stm32f103xb.s  # 注意：你的宏是 xB，启动文件最好也用 xB 或 x8，不要用 x6
 )
